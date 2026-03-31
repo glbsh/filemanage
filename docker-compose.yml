@@ -29,7 +29,7 @@ services:
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -46,6 +46,7 @@ services:
 
   storage-service:
     build: ./storage-service
+    restart: on-failure
     ports:
       - "8080:8080"
     environment:
@@ -64,6 +65,7 @@ services:
 
   metadata-service:
     build: ./metadata-service
+    restart: on-failure
     ports:
       - "8081:8081"
     environment:
@@ -78,6 +80,7 @@ services:
 
   notification-service:
     build: ./notification-service
+    restart: on-failure
     ports:
       - "8082:8082"
     environment:
