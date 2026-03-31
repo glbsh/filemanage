@@ -20,3 +20,12 @@ coverage.out
 
 # OS
 .DS_Store
+
+# Compiled CLI binaries
+cli/cli
+cli/filemanage
+
+# Test artifacts
+*.txt
+downloaded.*
+testfile.*
