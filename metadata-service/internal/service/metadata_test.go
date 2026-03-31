@@ -165,3 +165,94 @@ func TestSaveSetsUploadedAt(t *testing.T) {
 		t.Errorf("UploadedAt not set correctly: %v", saved.UploadedAt)
 	}
 }
+
+// TestConcurrentSaveListDelete fires concurrent saves, lists, and deletes and
+// checks for data races and final consistency.
+func TestConcurrentSaveListDelete(t *testing.T) {
+	svc := service.NewMetadataService(newInMemoryStore())
+	const n = 40
+
+	// Phase 1: save n records concurrently.
+	ids := make([]string, n)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	wg.Add(n)
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("uuid-concurrent-%d", i)
+			m := service.FileMetadata{
+				ID:          id,
+				Filename:    fmt.Sprintf("file%d.txt", i),
+				Size:        int64(i * 100),
+				ContentType: "text/plain",
+				Location:    fmt.Sprintf("files/%s", id),
+			}
+			if _, err := svc.Save(context.Background(), m); err != nil {
+				t.Errorf("Save(%d) error: %v", i, err)
+				return
+			}
+			mu.Lock()
+			ids[i] = id
+			mu.Unlock()
+		}(i)
+	}
+	wg.Wait()
+
+	// Phase 2: concurrent list + delete (first half) + save more.
+	const deleters = n / 2
+	const extra = 10
+
+	wg.Add(deleters + extra + 3) // 3 list goroutines
+
+	// Delete first half.
+	for i := 0; i < deleters; i++ {
+		go func(id string) {
+			defer wg.Done()
+			svc.Delete(context.Background(), id) // ignore not-found
+		}(ids[i])
+	}
+
+	// List concurrently three times.
+	for i := 0; i < 3; i++ {
+		go func() {
+			defer wg.Done()
+			all, err := svc.ListAll(context.Background())
+			if err != nil {
+				t.Errorf("ListAll() error: %v", err)
+				return
+			}
+			// Length is non-deterministic but must be non-negative.
+			if len(all) < 0 {
+				t.Error("ListAll() returned negative length")
+			}
+		}()
+	}
+
+	// Save extra records while deletes+lists are in flight.
+	for i := 0; i < extra; i++ {
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprintf("uuid-extra-%d", i)
+			m := service.FileMetadata{
+				ID: id, Filename: fmt.Sprintf("extra%d.txt", i),
+				Size: 1, ContentType: "text/plain", Location: "l",
+			}
+			if _, err := svc.Save(context.Background(), m); err != nil {
+				t.Errorf("extra Save(%d) error: %v", i, err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// Final state: (n - deleters) + extra records should exist.
+	all, err := svc.ListAll(context.Background())
+	if err != nil {
+		t.Fatalf("final ListAll() error: %v", err)
+	}
+	expected := (n - deleters) + extra
+	if len(all) != expected {
+		t.Errorf("expected %d records after concurrent ops, got %d", expected, len(all))
+	}
+}

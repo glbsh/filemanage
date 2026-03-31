@@ -9,6 +9,14 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
 
+// Ensure MinioClient implements the service.MinioStorage interface at compile time.
+var _ interface {
+	Upload(context.Context, string, io.Reader, int64, string) error
+	Download(context.Context, string) (io.ReadCloser, minio.ObjectInfo, error)
+	Delete(context.Context, string) error
+	Stat(context.Context, string) (minio.ObjectInfo, error)
+} = (*MinioClient)(nil)
+
 const defaultBucket = "files"
 
 type MinioClient struct {
@@ -55,8 +63,17 @@ func (m *MinioClient) Upload(ctx context.Context, id string, reader io.Reader, s
 	return err
 }
 
-func (m *MinioClient) Download(ctx context.Context, id string) (*minio.Object, error) {
-	return m.client.GetObject(ctx, m.bucket, id, minio.GetObjectOptions{})
+func (m *MinioClient) Download(ctx context.Context, id string) (io.ReadCloser, minio.ObjectInfo, error) {
+	obj, err := m.client.GetObject(ctx, m.bucket, id, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, minio.ObjectInfo{}, err
+	}
+	info, err := obj.Stat()
+	if err != nil {
+		obj.Close()
+		return nil, minio.ObjectInfo{}, err
+	}
+	return obj, info, nil
 }
 
 func (m *MinioClient) Delete(ctx context.Context, id string) error {

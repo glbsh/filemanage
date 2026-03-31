@@ -11,10 +11,10 @@ import (
 
 type MetadataHandler struct {
 	svc *service.MetadataService
-	pub *events.Publisher
+	pub events.Notifier
 }
 
-func NewMetadataHandler(svc *service.MetadataService, pub *events.Publisher) *MetadataHandler {
+func NewMetadataHandler(svc *service.MetadataService, pub events.Notifier) *MetadataHandler {
 	return &MetadataHandler{svc: svc, pub: pub}
 }
 

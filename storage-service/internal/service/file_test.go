@@ -36,9 +36,14 @@ func (f *fakeMinio) Upload(_ context.Context, id string, r io.Reader, _ int64, _
 	return nil
 }
 
-func (f *fakeMinio) Download(_ context.Context, id string) (*minio.Object, error) {
-	// Real minio.Object cannot be constructed in unit tests; return error to exercise error path.
-	return nil, fmt.Errorf("not implemented in fake")
+func (f *fakeMinio) Download(_ context.Context, id string) (io.ReadCloser, minio.ObjectInfo, error) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	b, ok := f.data[id]
+	if !ok {
+		return nil, minio.ObjectInfo{}, fmt.Errorf("not found")
+	}
+	return io.NopCloser(bytes.NewReader(b)), minio.ObjectInfo{Key: id, Size: int64(len(b))}, nil
 }
 
 func (f *fakeMinio) Delete(_ context.Context, id string) error {
@@ -60,6 +65,12 @@ func (f *fakeMinio) Stat(_ context.Context, id string) (minio.ObjectInfo, error)
 	return minio.ObjectInfo{Key: id}, nil
 }
 
+func (f *fakeMinio) count() int {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return len(f.data)
+}
+
 // buildHeader creates a *multipart.FileHeader backed by real bytes.
 func buildHeader(filename, contentType string, data []byte) *multipart.FileHeader {
 	body := &bytes.Buffer{}
@@ -77,6 +88,8 @@ func buildHeader(filename, contentType string, data []byte) *multipart.FileHeade
 	form, _ := mr.ReadForm(1 << 20)
 	return form.File["file"][0]
 }
+
+// --- Upload tests ---
 
 func TestUploadGeneratesUUID(t *testing.T) {
 	svc := service.NewFileServiceWithStorage(newFakeMinio(), "files", 2)
@@ -128,7 +141,166 @@ func TestUploadUUIDsAreUnique(t *testing.T) {
 	}
 }
 
-func TestUploadConcurrency(t *testing.T) {
+// --- Retrieve test ---
+
+func TestDownloadReturnsUploadedContent(t *testing.T) {
+	store := newFakeMinio()
+	svc := service.NewFileServiceWithStorage(store, "files", 2)
+
+	content := []byte("file content here")
+	header := buildHeader("data.txt", "text/plain", content)
+	res, err := svc.Upload(context.Background(), header)
+	if err != nil {
+		t.Fatalf("Upload() error: %v", err)
+	}
+
+	rc, info, err := svc.Download(context.Background(), res.ID)
+	if err != nil {
+		t.Fatalf("Download() error: %v", err)
+	}
+	defer rc.Close()
+
+	got, _ := io.ReadAll(rc)
+	if !bytes.Equal(got, content) {
+		t.Errorf("expected content %q, got %q", content, got)
+	}
+	if info.Key != res.ID {
+		t.Errorf("expected key %q, got %q", res.ID, info.Key)
+	}
+}
+
+func TestDownloadNonExistentReturnsError(t *testing.T) {
+	svc := service.NewFileServiceWithStorage(newFakeMinio(), "files", 2)
+	_, _, err := svc.Download(context.Background(), "ghost-id")
+	if err == nil {
+		t.Error("expected error downloading non-existent file")
+	}
+}
+
+// --- Delete tests ---
+
+func TestDeleteExistingFile(t *testing.T) {
+	store := newFakeMinio()
+	svc := service.NewFileServiceWithStorage(store, "files", 2)
+
+	header := buildHeader("todelete.txt", "text/plain", []byte("bye"))
+	res, err := svc.Upload(context.Background(), header)
+	if err != nil {
+		t.Fatalf("Upload() error: %v", err)
+	}
+
+	if err := svc.Delete(context.Background(), res.ID); err != nil {
+		t.Errorf("Delete() error: %v", err)
+	}
+
+	// Confirm it's gone.
+	_, _, err = svc.Download(context.Background(), res.ID)
+	if err == nil {
+		t.Error("expected error downloading deleted file")
+	}
+}
+
+func TestDeleteNonExistentFile(t *testing.T) {
+	svc := service.NewFileServiceWithStorage(newFakeMinio(), "files", 2)
+	if err := svc.Delete(context.Background(), "non-existent-id"); err == nil {
+		t.Error("expected error when deleting non-existent file")
+	}
+}
+
+// --- Concurrent mixed-operation test ---
+
+// TestConcurrentUploadRetrieveDelete fires concurrent uploads, retrieves, and
+// deletes simultaneously and checks for data races and consistency.
+func TestConcurrentUploadRetrieveDelete(t *testing.T) {
+	store := newFakeMinio()
+	svc := service.NewFileServiceWithStorage(store, "files", 10)
+
+	const uploaders = 20
+	const deleters = 10
+
+	// Phase 1: upload files concurrently, collect IDs.
+	ids := make([]string, uploaders)
+	var uploadWg sync.WaitGroup
+	var mu sync.Mutex
+
+	uploadWg.Add(uploaders)
+	for i := 0; i < uploaders; i++ {
+		go func(i int) {
+			defer uploadWg.Done()
+			content := fmt.Sprintf("content-%d", i)
+			header := buildHeader(fmt.Sprintf("file%d.txt", i), "text/plain", []byte(content))
+			res, err := svc.Upload(context.Background(), header)
+			if err != nil {
+				t.Errorf("Upload(%d) error: %v", i, err)
+				return
+			}
+			mu.Lock()
+			ids[i] = res.ID
+			mu.Unlock()
+		}(i)
+	}
+	uploadWg.Wait()
+
+	// Phase 2: concurrently retrieve all files and delete the first half,
+	// while new uploads continue.
+	var wg sync.WaitGroup
+
+	// Retrieve all uploaded files.
+	for i := 0; i < uploaders; i++ {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			if id == "" {
+				return
+			}
+			rc, _, err := svc.Download(context.Background(), id)
+			if err != nil {
+				// May have been deleted concurrently — acceptable.
+				return
+			}
+			io.ReadAll(rc)
+			rc.Close()
+		}(ids[i])
+	}
+
+	// Delete first half concurrently.
+	for i := 0; i < deleters; i++ {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			if id == "" {
+				return
+			}
+			svc.Delete(context.Background(), id) // ignore not-found errors
+		}(ids[i])
+	}
+
+	// Upload more files while deletes + retrieves are in flight.
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			header := buildHeader(fmt.Sprintf("extra%d.txt", i), "text/plain", []byte(fmt.Sprintf("extra-%d", i)))
+			if _, err := svc.Upload(context.Background(), header); err != nil {
+				t.Errorf("extra Upload(%d) error: %v", i, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// After deleting the first deleters files and adding 10 more, total should be
+	// at least (uploaders - deleters) and at most (uploaders + 10).
+	count := store.count()
+	min := uploaders - deleters
+	max := uploaders + 10
+	if count < min || count > max {
+		t.Errorf("unexpected file count: got %d, want [%d, %d]", count, min, max)
+	}
+}
+
+// TestConcurrentUploadOnly is the original concurrency smoke test.
+func TestConcurrentUploadOnly(t *testing.T) {
 	svc := service.NewFileServiceWithStorage(newFakeMinio(), "files", 5)
 
 	const n = 50
@@ -150,28 +322,5 @@ func TestUploadConcurrency(t *testing.T) {
 		if err := <-results; err != nil {
 			t.Errorf("concurrent Upload() error: %v", err)
 		}
-	}
-}
-
-func TestDeleteExistingFile(t *testing.T) {
-	store := newFakeMinio()
-	svc := service.NewFileServiceWithStorage(store, "files", 2)
-
-	header := buildHeader("todelete.txt", "text/plain", []byte("bye"))
-	res, err := svc.Upload(context.Background(), header)
-	if err != nil {
-		t.Fatalf("Upload() error: %v", err)
-	}
-
-	if err := svc.Delete(context.Background(), res.ID); err != nil {
-		t.Errorf("Delete() error: %v", err)
-	}
-}
-
-func TestDeleteNonExistentFile(t *testing.T) {
-	svc := service.NewFileServiceWithStorage(newFakeMinio(), "files", 2)
-	err := svc.Delete(context.Background(), "non-existent-id")
-	if err == nil {
-		t.Error("expected error when deleting non-existent file")
 	}
 }

@@ -14,7 +14,7 @@ import (
 // MinioStorage is the subset of MinioClient used by FileService.
 type MinioStorage interface {
 	Upload(ctx context.Context, id string, reader io.Reader, size int64, contentType string) error
-	Download(ctx context.Context, id string) (*minio.Object, error)
+	Download(ctx context.Context, id string) (io.ReadCloser, minio.ObjectInfo, error)
 	Delete(ctx context.Context, id string) error
 	Stat(ctx context.Context, id string) (minio.ObjectInfo, error)
 }
@@ -104,17 +104,8 @@ func (fs *FileService) Upload(ctx context.Context, header *multipart.FileHeader)
 	}, nil
 }
 
-func (fs *FileService) Download(ctx context.Context, id string) (*minio.Object, *minio.ObjectInfo, error) {
-	obj, err := fs.store.Download(ctx, id)
-	if err != nil {
-		return nil, nil, err
-	}
-	info, err := obj.Stat()
-	if err != nil {
-		obj.Close()
-		return nil, nil, err
-	}
-	return obj, &info, nil
+func (fs *FileService) Download(ctx context.Context, id string) (io.ReadCloser, minio.ObjectInfo, error) {
+	return fs.store.Download(ctx, id)
 }
 
 func (fs *FileService) Delete(ctx context.Context, id string) error {

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -130,6 +131,49 @@ func TestStreamForwardsMultipleMessages(t *testing.T) {
 	if dataLines != len(events) {
 		t.Errorf("expected %d data lines, got %d\nbody:\n%s", len(events), dataLines, body)
 	}
+}
+
+func TestStreamAllEventTypes(t *testing.T) {
+	payloads := []string{
+		`{"event":"file.uploaded","id":"1","filename":"a.txt","timestamp":"2024-01-01T00:00:00Z"}`,
+		`{"event":"file.deleted","id":"2","timestamp":"2024-01-01T00:00:00Z"}`,
+		`{"event":"metadata.created","id":"3","filename":"a.txt","timestamp":"2024-01-01T00:00:00Z"}`,
+	}
+	src := newFakeSource(payloads...)
+	h := handler.NewEventsHandler(src)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	req := httptest.NewRequest(http.MethodGet, "/events", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	h.Stream(rec, req)
+
+	body := rec.Body.String()
+	for _, p := range payloads {
+		if !strings.Contains(body, p) {
+			t.Errorf("missing event payload in SSE output: %s", p)
+		}
+	}
+}
+
+func TestStreamConcurrentClients(t *testing.T) {
+	// Verify the handler is safe to call from multiple goroutines simultaneously.
+	const clients = 10
+	var wg sync.WaitGroup
+	wg.Add(clients)
+	for i := 0; i < clients; i++ {
+		go func() {
+			defer wg.Done()
+			src := newFakeSource(`{"event":"file.uploaded","id":"x"}`)
+			h := handler.NewEventsHandler(src)
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			req := httptest.NewRequest(http.MethodGet, "/events", nil).WithContext(ctx)
+			h.Stream(httptest.NewRecorder(), req)
+		}()
+	}
+	wg.Wait()
 }
 
 func TestStreamDisconnectsOnContextCancel(t *testing.T) {

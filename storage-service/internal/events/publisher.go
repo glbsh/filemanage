@@ -12,6 +12,11 @@ import (
 
 const Channel = "filemanage:events"
 
+// Notifier is the interface handlers depend on — allows mocking in tests.
+type Notifier interface {
+	Publish(ctx context.Context, event Event)
+}
+
 type Publisher struct {
 	client *redis.Client
 }

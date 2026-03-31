@@ -12,10 +12,10 @@ import (
 
 type FileHandler struct {
 	svc *service.FileService
-	pub *events.Publisher
+	pub events.Notifier
 }
 
-func NewFileHandler(svc *service.FileService, pub *events.Publisher) *FileHandler {
+func NewFileHandler(svc *service.FileService, pub events.Notifier) *FileHandler {
 	return &FileHandler{svc: svc, pub: pub}
 }
 
@@ -60,16 +60,16 @@ func (h *FileHandler) Upload(w http.ResponseWriter, r *http.Request) {
 
 func (h *FileHandler) Download(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
-	obj, info, err := h.svc.Download(r.Context(), id)
+	rc, info, err := h.svc.Download(r.Context(), id)
 	if err != nil {
 		http.Error(w, "file not found", http.StatusNotFound)
 		return
 	}
-	defer obj.Close()
+	defer rc.Close()
 
 	w.Header().Set("Content-Type", info.ContentType)
 	w.Header().Set("Content-Disposition", "attachment; filename=\""+info.Key+"\"")
-	io.Copy(w, obj)
+	io.Copy(w, rc)
 }
 
 func (h *FileHandler) Delete(w http.ResponseWriter, r *http.Request) {
